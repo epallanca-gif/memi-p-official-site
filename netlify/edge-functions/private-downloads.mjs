@@ -1,4 +1,4 @@
-import { getStore } from "npm:@netlify/blobs";
+import { getStore } from "@netlify/blobs";
 
 const COOKIE_NAME = "memi_download_access";
 const TRACK_HASH = "c0097e66d9ea171e4ad1ddfd8ae09814ec0fddf073c5b2be7a472f29ca853190";
