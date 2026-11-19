@@ -1,8 +1,12 @@
 import { getStore } from "@netlify/blobs";
 
 const COOKIE_NAME = "memi_download_access";
-const TRACK_HASH = "c0097e66d9ea171e4ad1ddfd8ae09814ec0fddf073c5b2be7a472f29ca853190";
-const TRACK_SIZE = 10506533;
+const TRACKS = [
+  { key: "the-light.wav", filename: "MEMI P - The Light.wav", size: 54030318, hash: "3cfd74d608749cc8337cc2b9569f4bd13f2a6ba2dc33084bf3f8ad86cd6216ca" },
+  { key: "higher.wav", filename: "MEMI P - Higher.wav", size: 101277234, hash: "6f2015d9fc536ff7089db6ed27fad355afb7d4ab6e27613d189b05cab595d6f3" },
+  { key: "boogies-in-my-soul.wav", filename: "MEMI P - Boogie's in My Soul (Extended Mix).wav", size: 73953072, hash: "0f04921dc975bf854530c049a0081e655f131aecc58bfe83b12fa68959c3e80b" },
+  { key: "its-our-time-tonight.wav", filename: "MEMI P - It's Our Time Tonight (Vocal Mix).wav", size: 76688376, hash: "38a4ef9d8fdd363f0c783a830ee4c2cc3e10129c98450c2af4cd11a3cf7fa2da" },
+];
 const SESSION_SECONDS = 60 * 60 * 24;
 
 const encoder = new TextEncoder();
@@ -64,12 +68,14 @@ export default async (request, context) => {
   const parts = (readCookie(context.cookies.get(COOKIE_NAME)) || "").split(".");
   if (parts.length !== 3 || Number(parts[0]) <= Date.now() / 1000 || !sameValue(parts[2], await signature(`${parts[0]}.${parts[1]}`, configuredPassword))) return passwordPage();
 
-  if (url.pathname === "/downloads/higher.mp3") {
+  if (url.pathname === "/downloads/higher.mp3") return privateResponse("This download has been replaced by the WAV collection.", 410);
+  const track = TRACKS.find(item => url.pathname === `/downloads/${item.key}`);
+  if (track) {
     if (request.method !== "GET" && request.method !== "HEAD") return privateResponse("Method not allowed", 405);
-    const data = await getStore({ name: "private-music", consistency: "strong" }).get("higher.mp3", { type: "stream" });
-    if (!data) return privateResponse("Higher will be available shortly.", 503);
-    const response = privateResponse(request.method === "HEAD" ? null : data, 200, "audio/mpeg");
-    response.headers.set("Content-Disposition", 'attachment; filename="MEMI P - Higher (Extended Vocal).mp3"');
+    const data = await getStore({ name: "private-music", consistency: "strong" }).get(track.key, { type: "stream" });
+    if (!data) return privateResponse("This track will be available shortly.", 503);
+    const response = privateResponse(request.method === "HEAD" ? null : data, 200, "audio/wav");
+    response.headers.set("Content-Disposition", `attachment; filename="${track.filename}"`);
     return response;
   }
 
@@ -78,14 +84,18 @@ export default async (request, context) => {
     if (request.method === "POST") {
       const form = await request.formData();
       const file = form.get("track");
-      if (!file || file.size !== TRACK_SIZE) return privateResponse("Select the original Higher MP3.", 400);
+      const selected = TRACKS.find(item => item.size === file?.size);
+      if (!selected) return privateResponse("Select one of the four original WAV files.", 400);
       const bytes = await file.arrayBuffer();
       const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
-      if (hash !== TRACK_HASH) return privateResponse("The file does not match Higher.", 400);
-      await getStore({ name: "private-music", consistency: "strong" }).set("higher.mp3", bytes);
-      return privateResponse('<p>Higher uploaded successfully.</p><a href="/downloads/">Return to downloads</a>');
+      if (hash !== selected.hash) return privateResponse("The file does not match the original WAV.", 400);
+      const store = getStore({ name: "private-music", consistency: "strong" });
+      await store.set(selected.key, bytes);
+      const complete = await Promise.all(TRACKS.map(item => store.getMetadata(item.key)));
+      if (complete.every(Boolean)) await store.delete("higher.mp3");
+      return privateResponse('<p>WAV uploaded successfully.</p><a href="/downloads/setup">Upload another WAV</a> · <a href="/downloads/">Return to downloads</a>');
     }
-    return privateResponse('<!doctype html><html lang="en"><meta name="robots" content="noindex"><title>MEMI P. — Track setup</title><h1>Upload Higher</h1><form method="post" enctype="multipart/form-data"><input type="file" name="track" accept="audio/mpeg" required><button>Upload to private storage</button></form></html>');
+    return privateResponse('<!doctype html><html lang="en"><meta name="robots" content="noindex"><title>MEMI P. — Track setup</title><h1>Upload WAV collection</h1><p>Select one original WAV at a time. The previous MP3 is removed after all four WAVs have been uploaded.</p><form method="post" enctype="multipart/form-data"><input type="file" name="track" accept=".wav,audio/wav" required><button>Upload to private storage</button></form></html>');
   }
   const response = await context.next();
   response.headers.set("Cache-Control", "private, no-store");
