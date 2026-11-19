@@ -1,4 +1,5 @@
 import { getStore } from "@netlify/blobs";
+import { CHUNK_SIZE, CHUNK_HASHES } from "./wav-chunks.mjs";
 
 const COOKIE_NAME = "memi_download_access";
 const TRACKS = [
@@ -72,11 +73,52 @@ export default async (request, context) => {
   const track = TRACKS.find(item => url.pathname === `/downloads/${item.key}`);
   if (track) {
     if (request.method !== "GET" && request.method !== "HEAD") return privateResponse("Method not allowed", 405);
-    const data = await getStore({ name: "private-music", consistency: "strong" }).get(track.key, { type: "stream" });
+    const store = getStore({ name: "private-music", consistency: "strong" });
+    const ready = await store.get(`${track.key}.ready`, { type: "json" });
+    let data;
+    if (ready?.hash === track.hash) {
+      let index = 0;
+      data = new ReadableStream({
+        async pull(controller) {
+          try {
+            if (index === CHUNK_HASHES[track.key].length) { controller.close(); return; }
+            const part = await store.get(`wav-parts/${track.key}/${index++}`, { type: "arrayBuffer" });
+            if (!part) throw new Error("Missing WAV part");
+            controller.enqueue(new Uint8Array(part));
+          } catch (error) { controller.error(error); }
+        }
+      });
+    } else {
+      data = await store.get(track.key, { type: "stream" });
+    }
     if (!data) return privateResponse("This track will be available shortly.", 503);
     const response = privateResponse(request.method === "HEAD" ? null : data, 200, "audio/wav");
     response.headers.set("Content-Disposition", `attachment; filename="${track.filename}"`);
+    response.headers.set("Content-Length", String(track.size));
     return response;
+  }
+
+  if (url.pathname === "/downloads/upload-part" && request.method === "POST") {
+    const selected = TRACKS.find(item => item.key === url.searchParams.get("track"));
+    const index = Number(url.searchParams.get("part"));
+    if (!selected || !Number.isInteger(index) || index < 0 || index >= CHUNK_HASHES[selected.key].length) return privateResponse("Invalid part", 400);
+    const bytes = await request.arrayBuffer();
+    const expectedSize = Math.min(CHUNK_SIZE, selected.size - index * CHUNK_SIZE);
+    if (bytes.byteLength !== expectedSize) return privateResponse("Invalid part size", 400);
+    const hash = [...new Uint8Array(await crypto.subtle.digest("SHA-256", bytes))].map(b => b.toString(16).padStart(2, "0")).join("");
+    if (hash !== CHUNK_HASHES[selected.key][index]) return privateResponse("Invalid WAV content", 400);
+    await getStore({ name: "private-music", consistency: "strong" }).set(`wav-parts/${selected.key}/${index}`, bytes);
+    return privateResponse("Part saved", 200, "text/plain");
+  }
+
+  if (url.pathname === "/downloads/upload-complete" && request.method === "POST") {
+    const selected = TRACKS.find(item => item.key === url.searchParams.get("track"));
+    if (!selected) return privateResponse("Invalid track", 400);
+    const store = getStore({ name: "private-music", consistency: "strong" });
+    const parts = await Promise.all(CHUNK_HASHES[selected.key].map((_, index) => store.getMetadata(`wav-parts/${selected.key}/${index}`)));
+    if (!parts.every(Boolean)) return privateResponse("Upload incomplete. Retry the file.", 409);
+    await store.setJSON(`${selected.key}.ready`, { hash: selected.hash });
+    return privateResponse("WAV uploaded successfully", 200, "text/plain");
   }
 
   // Setup accepts only the exact artist-supplied track, never arbitrary files.
@@ -95,7 +137,29 @@ export default async (request, context) => {
       if (complete.every(Boolean)) await store.delete("higher.mp3");
       return privateResponse('<p>WAV uploaded successfully.</p><a href="/downloads/setup">Upload another WAV</a> · <a href="/downloads/">Return to downloads</a>');
     }
-    return privateResponse('<!doctype html><html lang="en"><meta name="robots" content="noindex"><title>MEMI P. — Track setup</title><h1>Upload WAV collection</h1><p>Select one original WAV at a time. The previous MP3 is removed after all four WAVs have been uploaded.</p><form method="post" enctype="multipart/form-data"><input type="file" name="track" accept=".wav,audio/wav" required><button>Upload to private storage</button></form></html>');
+    return privateResponse(`<!doctype html><html lang="en"><meta name="robots" content="noindex"><title>MEMI P. — Track setup</title><h1>Upload WAV collection</h1><p>Select one original WAV at a time. Keep this page open until the upload is complete.</p><form><input type="file" name="track" accept=".wav,audio/wav" required><button>Upload to private storage</button></form><p id="status" role="status"></p><a href="/downloads/">Return to downloads</a><script>
+    const tracks = ${JSON.stringify(TRACKS.map(({key,size}) => ({key,size})))};
+    const form = document.querySelector('form'), status = document.querySelector('#status');
+    form.addEventListener('submit', async event => {
+      event.preventDefault();
+      const file = form.elements.track.files[0], track = tracks.find(t => t.size === file?.size);
+      if (!track) { status.textContent = 'Select one of the four original WAV files.'; return; }
+      const button = form.querySelector('button'); button.disabled = true;
+      try {
+        const count = Math.ceil(file.size / ${CHUNK_SIZE});
+        for (let part = 0; part < count; part++) {
+          status.textContent = 'Uploading ' + file.name + ' — ' + Math.round(part / count * 100) + '%';
+          const response = await fetch('/downloads/upload-part?track=' + encodeURIComponent(track.key) + '&part=' + part, { method: 'POST', body: file.slice(part * ${CHUNK_SIZE}, (part + 1) * ${CHUNK_SIZE}) });
+          if (!response.ok || (await response.text()) !== 'Part saved') throw new Error('Upload interrupted. Please sign in if needed and retry.');
+        }
+        const response = await fetch('/downloads/upload-complete?track=' + encodeURIComponent(track.key), {method:'POST'});
+        const message = await response.text();
+        if (!response.ok || message !== 'WAV uploaded successfully') throw new Error('Could not finish upload. Please retry.');
+        status.textContent = file.name + ' — WAV uploaded successfully (100%).';
+      } catch (error) { status.textContent = error.message; }
+      finally { button.disabled = false; }
+    });
+    </script></html>`);
   }
   const response = await context.next();
   response.headers.set("Cache-Control", "private, no-store");
